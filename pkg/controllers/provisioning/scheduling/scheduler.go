@@ -459,7 +459,9 @@ func (s *Scheduler) add(ctx context.Context, pod *corev1.Pod) error {
 	if err := s.addToInflightNode(ctx, pod); err == nil {
 		return nil
 	}
-	err := s.addToNewNodeClaim(ctx, pod)
+	// If we get here, we are creating a new node claim. We use a flexible scheduling
+	// approach to consider all compatible nodepools and select the one that offers the best instance type.
+	err := s.addToNewNodeClaimFlexible(ctx, pod)
 	if err == nil {
 		return nil
 	}
@@ -627,6 +629,124 @@ func (s *Scheduler) addToNewNodeClaim(ctx context.Context, pod *corev1.Pod) erro
 	}
 	return multierr.Combine(errs...)
 }
+
+// addToNewNodeClaimFlexible finds all compatible node claim templates for a pod, and then selects the one that can provision
+// the cheapest instance type. This allows karpenter to be more flexible in its scheduling decisions when multiple
+// nodepools can accommodate a pod.
+// The previous behavior was to iterate through the nodepools in a static order and select the first one that was compatible.
+func (s *Scheduler) addToNewNodeClaimFlexible(ctx context.Context, pod *corev1.Pod) error {
+	// Candidate represents a potential launch choice
+	type candidate struct {
+		nodeClaim          *NodeClaim
+		requirements       scheduling.Requirements
+		instanceTypes      []*cloudprovider.InstanceType
+		offeringsToReserve []*cloudprovider.Offering
+	}
+
+	var candidates []*candidate
+	var mu sync.Mutex
+	errs := make([]error, len(s.nodeClaimTemplates))
+
+	// Parallelize the evaluation of node claim templates
+	var wg sync.WaitGroup
+	wg.Add(len(s.nodeClaimTemplates))
+
+	for i := range s.nodeClaimTemplates {
+		go func(i int) {
+			defer wg.Done()
+
+			// Check if the template is compatible
+			its := s.nodeClaimTemplates[i].InstanceTypeOptions
+			// if limits have been applied to the nodepool, ensure we filter instance types to avoid violating those limits
+			if remaining, ok := s.remainingResources[s.nodeClaimTemplates[i].NodePoolName]; ok {
+				its = filterByRemainingResources(its, remaining)
+				if len(its) == 0 {
+					errs[i] = serrors.Wrap(fmt.Errorf("all available instance types exceed limits for nodepool"), "NodePool", klog.KRef("", s.nodeClaimTemplates[i].NodePoolName))
+					return
+				}
+			}
+
+			nodeClaim := NewNodeClaim(s.nodeClaimTemplates[i], s.topology, s.daemonOverhead[s.nodeClaimTemplates[i]], s.daemonHostPortUsage[s.nodeClaimTemplates[i]], its, s.reservationManager, s.reservedOfferingMode)
+			r, its, ofs, err := nodeClaim.CanAdd(ctx, pod, s.cachedPodData[pod.UID], s.minValuesPolicy == karpopts.MinValuesPolicyBestEffort)
+			if err != nil {
+				errs[i] = err
+				return
+			}
+
+			mu.Lock()
+			candidates = append(candidates, &candidate{
+				nodeClaim:          nodeClaim,
+				requirements:       r,
+				instanceTypes:      its,
+				offeringsToReserve: ofs,
+			})
+			mu.Unlock()
+		}(i)
+	}
+	wg.Wait()
+
+	if len(candidates) == 0 {
+		return multierr.Combine(errs...)
+	}
+
+	// Select the best candidate
+	var bestCandidate *candidate
+	var bestInstanceType *cloudprovider.InstanceType
+
+	// podRequirements can be retrieved from cached data
+	podRequirements := s.cachedPodData[pod.UID].Requirements
+
+	for _, cand := range candidates {
+		// Get cheapest instance type for this candidate
+		orderedIts := cloudprovider.InstanceTypes(cand.instanceTypes).OrderByPrice(podRequirements)
+		if len(orderedIts) == 0 {
+			continue
+		}
+		currentBest := orderedIts[0]
+
+		if bestInstanceType == nil {
+			bestInstanceType = currentBest
+			bestCandidate = cand
+			continue
+		}
+
+		// Compare with overall best
+		currentPrice := currentBest.Offerings.Available().Compatible(podRequirements).Cheapest().Price
+		bestPrice := bestInstanceType.Offerings.Available().Compatible(podRequirements).Cheapest().Price
+
+		if currentPrice < bestPrice {
+			bestInstanceType = currentBest
+			bestCandidate = cand
+		}
+	}
+
+	if bestCandidate == nil {
+		return fmt.Errorf("no viable instance type found across all compatible nodepools")
+	}
+
+	// We have a winner. Add the pod to the winning node claim.
+	newNodeClaim := bestCandidate.nodeClaim
+	updatedRequirements := bestCandidate.requirements
+	updatedInstanceTypes := bestCandidate.instanceTypes
+	offeringsToReserve := bestCandidate.offeringsToReserve
+
+	_, minValuesRelaxed := lo.Find(newNodeClaim.Requirements.Keys().UnsortedList(), func(k string) bool {
+		updated := updatedRequirements.Get(k).MinValues
+		original := newNodeClaim.Requirements.Get(k).MinValues
+		return original != nil && updated != nil && lo.FromPtr(updated) < lo.FromPtr(original)
+	})
+	if minValuesRelaxed {
+		newNodeClaim.Annotations[v1.NodeClaimMinValuesRelaxedAnnotationKey] = "true"
+	} else {
+		newNodeClaim.Annotations[v1.NodeClaimMinValuesRelaxedAnnotationKey] = "false"
+	}
+
+	newNodeClaim.Add(pod, s.cachedPodData[pod.UID], updatedRequirements, updatedInstanceTypes, offeringsToReserve)
+	s.newNodeClaims = append(s.newNodeClaims, newNodeClaim)
+	s.remainingResources[newNodeClaim.NodePoolName] = subtractMax(s.remainingResources[newNodeClaim.NodePoolName], newNodeClaim.InstanceTypeOptions)
+	return nil
+}
+
 
 func (s *Scheduler) calculateExistingNodeClaims(stateNodes []*state.StateNode, daemonSetPods []*corev1.Pod) {
 	// create our existing nodes

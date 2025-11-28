@@ -26,6 +26,7 @@ import (
 	"github.com/samber/lo"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/sets"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
@@ -1577,6 +1578,83 @@ var _ = Describe("Instance Type Selection", func() {
 
 			// Ensures that NodeClaims are created with 2 instanceTypes
 			Expect(len(supportedInstanceTypes(cloudProvider.CreateCalls[0]))).To(BeNumerically(">=", 2))
+		})
+		It("should schedule on the cheapest instance across multiple nodepools", func() {
+			expensiveNodePool := test.NodePool(v1.NodePool{
+				ObjectMeta: metav1.ObjectMeta{Name: "expensive-nodepool"},
+				Spec: v1.NodePoolSpec{
+					Template: v1.NodeClaimTemplate{
+						Spec: v1.NodeClaimTemplateSpec{
+							Requirements: []v1.NodeSelectorRequirementWithMinValues{
+								{
+									NodeSelectorRequirement: corev1.NodeSelectorRequirement{
+										Key:      v1.CapacityTypeLabelKey,
+										Operator: corev1.NodeSelectorOpIn,
+										Values:   []string{v1.CapacityTypeSpot},
+									},
+								},
+							},
+						},
+					},
+				},
+			})
+			cheapNodePool := test.NodePool(v1.NodePool{
+				ObjectMeta: metav1.ObjectMeta{Name: "cheap-nodepool"},
+				Spec: v1.NodePoolSpec{
+					Template: v1.NodeClaimTemplate{
+						Spec: v1.NodeClaimTemplateSpec{
+							Requirements: []v1.NodeSelectorRequirementWithMinValues{
+								{
+									NodeSelectorRequirement: corev1.NodeSelectorRequirement{
+										Key:      v1.CapacityTypeLabelKey,
+										Operator: corev1.NodeSelectorOpIn,
+										Values:   []string{v1.CapacityTypeSpot},
+									},
+								},
+							},
+						},
+					},
+				},
+			})
+
+			expensiveInstance := fake.NewInstanceType(fake.InstanceTypeOptions{
+				Name: "expensive-instance",
+				Offerings: []*cloudprovider.Offering{
+					{
+						Price:       1.0,
+						Available:   true,
+						Requirements: scheduler.NewLabelRequirements(map[string]string{
+							v1.CapacityTypeLabelKey:    v1.CapacityTypeSpot,
+							corev1.LabelTopologyZone:   "test-zone-1a",
+							corev1.LabelArchStable:     v1.ArchitectureAmd64,
+						}),
+					},
+				},
+			})
+			cheapInstance := fake.NewInstanceType(fake.InstanceTypeOptions{
+				Name: "cheap-instance",
+				Offerings: []*cloudprovider.Offering{
+					{
+						Price:       0.1,
+						Available:   true,
+						Requirements: scheduler.NewLabelRequirements(map[string]string{
+							v1.CapacityTypeLabelKey:    v1.CapacityTypeSpot,
+							corev1.LabelTopologyZone:   "test-zone-1a",
+							corev1.LabelArchStable:     v1.ArchitectureAmd64,
+						}),
+					},
+				},
+			})
+			cloudProvider.InstanceTypesForNodePool = map[string][]*cloudprovider.InstanceType{
+				"expensive-nodepool": {expensiveInstance},
+				"cheap-nodepool":     {cheapInstance},
+			}
+
+			pod := test.UnschedulablePod()
+			ExpectApplied(ctx, env.Client, expensiveNodePool, cheapNodePool)
+			ExpectProvisioned(ctx, env.Client, cluster, cloudProvider, prov, pod)
+			node := ExpectScheduled(ctx, env.Client, pod)
+			Expect(node.Labels[corev1.LabelInstanceTypeStable]).To(Equal("cheap-instance"))
 		})
 	})
 })

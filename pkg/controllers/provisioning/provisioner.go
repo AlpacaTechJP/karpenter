@@ -238,10 +238,9 @@ func (p *Provisioner) NewScheduler(
 		return nil, ErrNodePoolsNotFound
 	}
 
-	// nodeTemplates generated from NodePools are ordered by weight
-	// since they are stored within a slice and scheduling
-	// will always attempt to schedule on the first nodeTemplate
-	nodepoolutils.OrderByWeight(nodePools)
+	// NodePools are not ordered by weight so that the scheduler can consider all compatible nodepools
+	// and choose the one that provides the cheapest instance type.
+	// nodepoolutils.OrderByWeight(nodePools)
 
 	instanceTypes := map[string][]*cloudprovider.InstanceType{}
 	for _, np := range nodePools {
