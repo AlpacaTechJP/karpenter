@@ -630,10 +630,9 @@ func (s *Scheduler) addToNewNodeClaim(ctx context.Context, pod *corev1.Pod) erro
 	return multierr.Combine(errs...)
 }
 
-// addToNewNodeClaimFlexible finds all compatible node claim templates for a pod, and then selects the one that can provision
-// the cheapest instance type. This allows karpenter to be more flexible in its scheduling decisions when multiple
-// nodepools can accommodate a pod.
-// The previous behavior was to iterate through the nodepools in a static order and select the first one that was compatible.
+// addToNewNodeClaimFlexible finds all compatible node claim templates for a pod, respecting nodepool weights.
+// Within nodepools of the same weight, it selects the one that can provision the cheapest instance type.
+// This allows karpenter to be flexible in its scheduling decisions while honoring weight-based prioritization.
 func (s *Scheduler) addToNewNodeClaimFlexible(ctx context.Context, pod *corev1.Pod) error {
 	// Candidate represents a potential launch choice
 	type candidate struct {
@@ -641,6 +640,7 @@ func (s *Scheduler) addToNewNodeClaimFlexible(ctx context.Context, pod *corev1.P
 		requirements       scheduling.Requirements
 		instanceTypes      []*cloudprovider.InstanceType
 		offeringsToReserve []*cloudprovider.Offering
+		weight             int32
 	}
 
 	var candidates []*candidate
@@ -679,6 +679,7 @@ func (s *Scheduler) addToNewNodeClaimFlexible(ctx context.Context, pod *corev1.P
 				requirements:       r,
 				instanceTypes:      its,
 				offeringsToReserve: ofs,
+				weight:             s.nodeClaimTemplates[i].NodePoolWeight,
 			})
 			mu.Unlock()
 		}(i)
@@ -689,14 +690,27 @@ func (s *Scheduler) addToNewNodeClaimFlexible(ctx context.Context, pod *corev1.P
 		return multierr.Combine(errs...)
 	}
 
-	// Select the best candidate
+	// Find the highest weight among all candidates
+	highestWeight := int32(0)
+	for _, cand := range candidates {
+		if cand.weight > highestWeight {
+			highestWeight = cand.weight
+		}
+	}
+
+	// Filter candidates to only those with the highest weight
+	candidatesWithHighestWeight := lo.Filter(candidates, func(c *candidate, _ int) bool {
+		return c.weight == highestWeight
+	})
+
+	// Select the best candidate among those with the highest weight
 	var bestCandidate *candidate
 	var bestInstanceType *cloudprovider.InstanceType
 
 	// podRequirements can be retrieved from cached data
 	podRequirements := s.cachedPodData[pod.UID].Requirements
 
-	for _, cand := range candidates {
+	for _, cand := range candidatesWithHighestWeight {
 		// Get cheapest instance type for this candidate
 		orderedIts := cloudprovider.InstanceTypes(cand.instanceTypes).OrderByPrice(podRequirements)
 		if len(orderedIts) == 0 {

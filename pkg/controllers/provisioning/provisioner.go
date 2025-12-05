@@ -238,9 +238,9 @@ func (p *Provisioner) NewScheduler(
 		return nil, ErrNodePoolsNotFound
 	}
 
-	// NodePools are not ordered by weight so that the scheduler can consider all compatible nodepools
-	// and choose the one that provides the cheapest instance type.
-	// nodepoolutils.OrderByWeight(nodePools)
+	// NodePools are ordered by weight. Within the same weight, the scheduler selects
+	// the nodepool that provides the cheapest instance type.
+	nodepoolutils.OrderByWeight(nodePools)
 
 	instanceTypes := map[string][]*cloudprovider.InstanceType{}
 	for _, np := range nodePools {
